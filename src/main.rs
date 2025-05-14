@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use std::env;
+use std::ffi::CString;
 #[allow(unused_imports)]
 use std::fs;
 use std::io;
@@ -8,7 +9,10 @@ use std::io::Read;
 use std::io::Write;
 
 use anyhow::Context;
+use bytes::Buf;
+use bytes::BufMut;
 use clap::{arg, Parser, Subcommand};
+use flate2::FlushCompress;
 
 #[derive(Parser, Debug)]
 #[command(version,about,long_about=None)]
@@ -47,17 +51,16 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::CatFile { pretty_print, hash } => {
             anyhow::ensure!(pretty_print, "Only pretty printing is supported now");
-            anyhow::ensure!(hash.len() == 40, "Only supporting 40 length hashes");
+            anyhow::ensure!(hash.len() == 40, "Only 40 length hashes are supported");
 
             let path = format!(".git/objects/{}/{}", &hash[..2], &hash[2..]);
-            let file = fs::File::open(path).context("failed to open file")?;
-            let mut reader = io::BufReader::new(file);
+            let file = fs::File::open(path).context("Failed to open file")?;
+            let z = flate2::read::ZlibDecoder::new(file);
+            let mut bz = io::BufReader::new(z);
             let mut buf = Vec::new();
-
-            reader
-                .read_until(0, &mut buf)
+            bz.read_until(0, &mut buf)
                 .context("Failed to read header")?;
-            let header = std::str::from_utf8(&buf).context("Parsing header")?;
+            let header = std::str::from_utf8(&buf[..buf.len()]).context("Parsing header")?;
             let (kind, size) = header.strip_suffix("\0").unwrap().split_once(" ").unwrap();
             let size = size
                 .parse::<usize>()
@@ -66,23 +69,11 @@ fn main() -> anyhow::Result<()> {
             if kind != "blob" {
                 anyhow::bail!("Only reading blobs is supported");
             }
-
-            let mut z = flate2::bufread::ZlibDecoder::new(reader);
-
             buf.clear();
             buf.resize(size, 0);
-            z.read_to_end(&mut buf)
-                .context(format!("Reading {} bytes from object", size))?;
-            let more = z
-                .read(&mut buf)
-                .context("Attempting to read more from object")?;
-            anyhow::ensure!(
-                more == 0,
-                format!(
-                    "Object contained {} more bytes than expected {}",
-                    more, size
-                )
-            );
+            bz.read_exact(&mut buf)
+                .context(format!("Couldnt read blob file"))?;
+
             io::stdout()
                 .lock()
                 .write_all(&buf)
