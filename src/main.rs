@@ -7,8 +7,6 @@ use std::io::Write;
 use anyhow::Context;
 use clap::{arg, Parser, Subcommand};
 use flate2::Compression;
-use sha1::digest::Update;
-use sha1::{Digest, Sha1};
 
 const READ_CHUNK_SIZE: usize = 1024 * 1;
 
@@ -83,62 +81,84 @@ fn main() -> anyhow::Result<()> {
                 .context("Couldnt write to stdout")?;
         }
         Commands::HashObject { write, filename } => {
-            let mut total = 0;
-            let mut reader = io::BufReader::new(fs::File::open(&filename).context("Opening file")?);
-            let mut buf = vec![0u8; READ_CHUNK_SIZE];
-            let mut hasher = Sha1::new();
+            fn compress_and_write<R, W>(
+                mut src: R,
+                mut dest: W,
+                filesize: u64,
+            ) -> anyhow::Result<String>
+            where
+                R: Read,
+                W: Write,
+            {
+                use sha1::Digest;
+                let mut hasher = sha1::Sha1::new();
+
+                let mut total_read = 0;
+                let mut buf = vec![0u8; READ_CHUNK_SIZE];
+
+                let header = format!("blob {}\0", filesize);
+                dest.write(header.as_bytes())
+                    .context("Writing expected header")?;
+                Digest::update(&mut hasher, header);
+
+                loop {
+                    let n = src
+                        .read(&mut buf[..])
+                        .context("Reading a chunk of the file")?;
+                    if n == 0 {
+                        break; // EOF
+                    }
+                    total_read += n;
+                    dest.write(&buf[..n])
+                        .context("Writing a chunk of the file")?;
+                    Digest::update(&mut hasher, &buf[..n]);
+                }
+                dest.flush()
+                    .context("Flushing remaining bytes to the file")?;
+
+                anyhow::ensure!(
+                    total_read as u64 == filesize, // <- usize fits into u64
+                    "Expected to read {filesize}, got {total_read}"
+                );
+
+                let hash = format!("{:x}", hasher.finalize());
+                anyhow::ensure!(hash.len() == 40, "Hash length is not 40");
+
+                Ok(hash)
+            }
+
+            let reader = io::BufReader::new(fs::File::open(&filename).context("Opening file")?);
 
             let attr = fs::metadata(&filename)
                 .context(format!("Reading metadata of file {}", &filename))?;
-            let filesize = attr.len(); // < TOUTOC or smth
             if !attr.is_file() {
                 anyhow::bail!("Only hashing blobs is supported");
             }
 
-            if write {
-                let outf = fs::File::create("tmp").context("Creating temporary file")?;
+            // something might might mingle with the file after calling metadata()
+            // so we take a refernece to the original file size, then compare it with
+            // the number of bytes we read
+            let filesize = attr.len();
+
+            let hash = if write {
+                let tmp = "tmp";
+                let outf = fs::File::create(tmp).context("Creating temporary file")?;
                 let w = io::BufWriter::new(outf);
-                let mut z = flate2::write::ZlibEncoder::new(w, Compression::default());
-                let mut i = 0;
-                loop {
-                    let n = reader
-                        .read(&mut buf[..])
-                        .context("Reading chunks of the file")?;
-                    if n == 0 {
-                        //EOF
-                        break;
-                    }
-                    total += n;
-                    log::debug!("Chunk({}):  {} bytes of {}", i, total, attr.len());
-                    Update::update(&mut hasher, &buf[..n]);
-                    z.write(&buf[..n]).context("Writing chunk to the file")?;
-                    i += 1;
-                }
-                z.flush().context("Flushing remaining bytes to the file")?;
+                let z = flate2::write::ZlibEncoder::new(w, Compression::default());
 
-                log::debug!("File size {}, got {}", &filesize, &total);
+                let hash = compress_and_write(reader, z, filesize)?;
+                let dirpath = format!(".git/objects/{}/", &hash[..2]);
+                fs::create_dir_all(&dirpath).with_context(|| {
+                    format!("creating directory for compressed file at {}", &dirpath)
+                })?;
+                fs::rename(tmp, format!("{}/{}", &dirpath, &hash[2..]))?;
+
+                hash
             } else {
-                loop {
-                    let n = reader
-                        .read(&mut buf[..])
-                        .context("Reading chunks of the file")?;
-                    if n == 0 {
-                        //EOF
-                        break;
-                    }
-                    total += n;
-                    Update::update(&mut hasher, &buf[..n]);
-                }
-            }
+                compress_and_write(reader, io::sink(), filesize)?
+            };
 
-            anyhow::ensure!(
-                total as u64 == filesize,
-                "Expected file size {filesize} got {total}"
-            );
-            Update::update(&mut hasher, "blob \0".as_bytes());
-            Update::update(&mut hasher, format!("{}", filesize).as_bytes());
-
-            println!("{:x}", hasher.finalize());
+            println!("{}", hash);
         }
     }
 
